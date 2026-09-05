@@ -1,11 +1,109 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { GoogleGenAI, Type } from '@google/genai';
 
-// ── Local fallback (copied from your server.ts) ──────────────────────────────
-function generateLocalSuggestion({ mood, moodLabel, energyLevel, sleepHours, tags, reflection }: {
-  mood?: string; moodLabel?: string; energyLevel?: number;
-  sleepHours?: number; tags?: string[]; reflection?: string;
-}) {
+// ── Rate limiting (Upstash) ───────────────────────────────────────────────────
+// If UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN are set, rate limiting
+// is enforced: 10 requests per IP per minute. If not set, it is skipped
+// (safe for local dev / initial deploy without Upstash).
+async function checkRateLimit(ip: string): Promise<{ allowed: boolean; remaining: number }> {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return { allowed: true, remaining: -1 };
+
+  const key = `rl:checkin:${ip}`;
+  const windowSecs = 60;
+  const maxRequests = 10;
+
+  try {
+    // INCR + EXPIRE in a pipeline
+    const res = await fetch(`${url}/pipeline`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify([
+        ['INCR', key],
+        ['EXPIRE', key, windowSecs, 'NX'],
+      ]),
+    });
+    const data = await res.json() as Array<{ result: number }>;
+    const count = data[0]?.result ?? 1;
+    return { allowed: count <= maxRequests, remaining: Math.max(0, maxRequests - count) };
+  } catch {
+    // If Upstash is unreachable, fail open
+    return { allowed: true, remaining: -1 };
+  }
+}
+
+// ── Input validation ──────────────────────────────────────────────────────────
+const VALID_MOODS = ['great', 'good', 'neutral', 'down', 'stressed', 'overwhelmed'];
+
+function validateInput(body: unknown): { valid: true; data: CheckInInput } | { valid: false; error: string } {
+  if (!body || typeof body !== 'object') {
+    return { valid: false, error: 'Request body must be a JSON object.' };
+  }
+  const b = body as Record<string, unknown>;
+
+  // mood — required, must be one of the known values
+  if (typeof b.mood !== 'string' || !VALID_MOODS.includes(b.mood)) {
+    return { valid: false, error: `mood must be one of: ${VALID_MOODS.join(', ')}.` };
+  }
+
+  // moodLabel — optional string, max 50 chars
+  if (b.moodLabel !== undefined && (typeof b.moodLabel !== 'string' || b.moodLabel.length > 50)) {
+    return { valid: false, error: 'moodLabel must be a string under 50 characters.' };
+  }
+
+  // energyLevel — optional number 1–5
+  if (b.energyLevel !== undefined) {
+    const e = Number(b.energyLevel);
+    if (!Number.isInteger(e) || e < 1 || e > 5) {
+      return { valid: false, error: 'energyLevel must be an integer between 1 and 5.' };
+    }
+  }
+
+  // sleepHours — optional number 0–24
+  if (b.sleepHours !== undefined) {
+    const s = Number(b.sleepHours);
+    if (isNaN(s) || s < 0 || s > 24) {
+      return { valid: false, error: 'sleepHours must be a number between 0 and 24.' };
+    }
+  }
+
+  // tags — optional array of strings, max 10 items, each max 30 chars
+  if (b.tags !== undefined) {
+    if (!Array.isArray(b.tags) || b.tags.length > 10 || b.tags.some(t => typeof t !== 'string' || t.length > 30)) {
+      return { valid: false, error: 'tags must be an array of up to 10 strings (max 30 chars each).' };
+    }
+  }
+
+  // reflection — optional string, max 500 chars
+  if (b.reflection !== undefined && (typeof b.reflection !== 'string' || b.reflection.length > 500)) {
+    return { valid: false, error: 'reflection must be a string under 500 characters.' };
+  }
+
+  return {
+    valid: true,
+    data: {
+      mood: b.mood,
+      moodLabel: typeof b.moodLabel === 'string' ? b.moodLabel : undefined,
+      energyLevel: b.energyLevel !== undefined ? Number(b.energyLevel) : undefined,
+      sleepHours: b.sleepHours !== undefined ? Number(b.sleepHours) : undefined,
+      tags: Array.isArray(b.tags) ? (b.tags as string[]) : undefined,
+      reflection: typeof b.reflection === 'string' ? b.reflection.trim() : undefined,
+    },
+  };
+}
+
+interface CheckInInput {
+  mood: string;
+  moodLabel?: string;
+  energyLevel?: number;
+  sleepHours?: number;
+  tags?: string[];
+  reflection?: string;
+}
+
+// ── Local fallback ────────────────────────────────────────────────────────────
+function generateLocalSuggestion({ mood, moodLabel, energyLevel, sleepHours }: CheckInInput) {
   const isLowSleep = (sleepHours || 7) < 6;
   const isHighEnergy = (energyLevel || 3) >= 4;
   const isLowEnergy = (energyLevel || 3) <= 2;
@@ -37,7 +135,7 @@ function generateLocalSuggestion({ mood, moodLabel, energyLevel, sleepHours, tag
   } else if (mood === 'great' || isHighEnergy) {
     supportiveInsight = "Wonderful surge of positive energy! You're set up to engage with your goals.";
     energySleepAdvice = `Energy ${energyLevel}/5 and ${sleepHours}h sleep — great cognitive focus today.`;
-    microActions = ["Tackle your hardest assignment now while focus is sharp.", "Share an encouraging word with a classmate.", "Set a water reminder so you don't burn out."];
+    microActions = ["Tackle your hardest assignment now.", "Share an encouraging word with a classmate.", "Set a water reminder so you don't burn out."];
     mindsetAffirmation = "I channel my positive energy into purposeful steps.";
     recommendedPractice = { title: "Focus Pomodoro Session", description: "Sustain high productivity.", toolId: "pomodoro-timer" };
   }
@@ -49,11 +147,24 @@ function generateLocalSuggestion({ mood, moodLabel, energyLevel, sleepHours, tag
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { mood, moodLabel, energyLevel, sleepHours, tags, reflection } = req.body;
-  const apiKey = process.env.GEMINI_API_KEY;
+  // Rate limiting
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || 'unknown';
+  const { allowed, remaining } = await checkRateLimit(ip);
+  if (!allowed) {
+    return res.status(429).json({ error: 'Too many requests. Please wait a minute and try again.' });
+  }
+  if (remaining >= 0) res.setHeader('X-RateLimit-Remaining', remaining);
 
+  // Input validation
+  const validation = validateInput(req.body);
+  if (!validation.valid) {
+    return res.status(400).json({ error: validation.error });
+  }
+  const { mood, moodLabel, energyLevel, sleepHours, tags, reflection } = validation.data;
+
+  const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    return res.json(generateLocalSuggestion({ mood, moodLabel, energyLevel, sleepHours, tags, reflection }));
+    return res.json(generateLocalSuggestion(validation.data));
   }
 
   try {
@@ -98,8 +209,8 @@ Provide empathetic, personalized guidance. Avoid clinical diagnosis or medical c
       } catch (_) { continue; }
     }
 
-    return res.json(generateLocalSuggestion({ mood, moodLabel, energyLevel, sleepHours, tags, reflection }));
-  } catch (error) {
-    return res.json(generateLocalSuggestion({ mood, moodLabel, energyLevel, sleepHours, tags, reflection }));
+    return res.json(generateLocalSuggestion(validation.data));
+  } catch {
+    return res.json(generateLocalSuggestion(validation.data));
   }
 }
