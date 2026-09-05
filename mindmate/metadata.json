@@ -1,0 +1,6 @@
+{
+  "name": "MindMate",
+  "description": "Student mental wellness awareness and wellbeing platform for college students with interactive toolkits, daily check-ins, educational guides, and support resources.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
